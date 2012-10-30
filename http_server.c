@@ -395,6 +395,7 @@ http_server_daemon (void *arg) {
 	allow_signal(SIGKILL);
 	allow_signal(SIGTERM);
 	while (!kthread_should_stop()) {
+		int yes=1;
 		err = kernel_accept(param->listen_socket, &socket, 0);
 		if (err < 0) {
 			if (signal_pending(current)) {
@@ -403,6 +404,7 @@ http_server_daemon (void *arg) {
 			printk(KERN_ERR MODULE_NAME ": kernel_accept() error: %d\n", err);
 			continue;
 		}
+		kernel_setsockopt(socket, SOL_TCP, TCP_NODELAY, (void*)&yes, sizeof(yes));
 		worker = kthread_run(http_server_worker, socket, MODULE_NAME);
 		if (IS_ERR(worker)) {
 			printk(KERN_ERR MODULE_NAME ": can't create more worker process\n");
