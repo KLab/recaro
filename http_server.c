@@ -196,8 +196,51 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 		http_server_send(request->socket, p, size, 0);
 		return 0;
 	}
-	//TODO: SSI対応.
-	return 503;
+	else {
+		int cur;
+		if (*keep_alive) {
+			w += sprintf(w, "Connection: keep-alive\r\n");
+		}
+		w += sprintf(w, "Transfer-Encoding: chunked\r\n\r\n");
+		http_server_send(request->socket, buf, w-buf, 1);
+		//printk("start sending %ld chunks\n", nchunk);
+
+		for (cur=0; cur<nchunk; ++cur) {
+			long size = simple_strtol(p, &q, 16);
+			//printk("chunk size: %ld\n", size);
+			p = q = q + 2;
+			w = buf + sprintf(buf, "%lx\r\n", size);
+			http_server_send(request->socket, buf, w-buf, 1);
+			http_server_send(request->socket, p, size, 1);
+			http_server_send(request->socket, CRLF, 2, 1);
+			p = q = q + size + 2;
+
+			if (cur+1 < nchunk) {
+				item_t *subitem;
+				// TODO: SSIの入れ子に対応.
+				while (*q != '\r') {
+					q++;
+				}
+				subitem = get_item(p, q-p);
+				strncpy(buf, p, q-p);
+				buf[q-p] = '\0';
+				//printk("loading '%s'\n", buf);
+				p = q = q+2;
+				if (subitem == NULL) {
+					printk("can't load subitem.\n");
+					continue;
+				}
+				//printk("ssi chunk size: %ld\n", subitem->size);
+				size = sprintf(buf, "%lx\r\n", subitem->size);
+				http_server_send(request->socket, buf, size, 1);
+				http_server_send(request->socket, subitem->data, subitem->size, 1);
+				http_server_send(request->socket, CRLF, 2, 1);
+				release_item(subitem);
+			}
+		}
+		http_server_send(request->socket, "0\r\n\r\n", 5, 0);
+		return 0;
+	}
 }
 
 static int
