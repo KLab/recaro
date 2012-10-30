@@ -87,6 +87,9 @@
 	CRLF                                           \
 	"505 HTTP Version Not Supported" CRLF
 
+#define CONTENT_TYPE "Content-Type: "
+#define CONTENT_LENGTH "Content-Length: "
+
 #define RECV_BUFFER_SIZE 4096
 
 struct http_request {
@@ -155,12 +158,50 @@ http_server_send (struct socket *sock, const char *buf, size_t size) {
 
 static int
 response_from_item(item_t *item, struct http_request *request, int *keep_alive) {
-	char *ptr, *end;
-	ptr = item->data;
-	end = ptr + item->size;
+	char *start, *p, *q, *end;
+	char buf[128] = "HTTP/1.1 200 OK\r\n";
+	char *w = buf + strlen(buf);
+	long nchunk;
+
+	start = p = item->data;
+	end = start + item->size;
+
+	// 1行目: content_type
+	q = p;
+	while (*q != '\r') {
+		q++;
+		if (q == end) {
+			printk("BAD CACHE: %s\n", request->request_url);
+			return 503;
+		}
+	}
+	strcpy(w, CONTENT_TYPE); w += strlen(CONTENT_TYPE);
+	memcpy(w, p, q-p); w += q-p;
+	*w++ = '\r';
+	*w++ = '\n';
+	p = q = q + 2; // skip \r\n
+
+	// 2行目チャンク数.
+	nchunk = simple_strtol(p, &q, 10); p = q = q + 2;
+
+	if (nchunk <= 0) {
+		printk("BUG: nchunk=%ld\n", nchunk);
+		return 503;
+	}
+	else if (nchunk == 1) {
+		// simple response.
+		// chunkサイズは chunked encoding にならって 16進
+		long size = simple_strtol(p, &q, 16); p = q = q+2;
+		if (*keep_alive) {
+			w += sprintf(w, "Connection: keep-alive\r\n");
+		}
+		w += sprintf(w, "Content-Length: %ld\r\n\r\n", size);
+		http_server_send(request->socket, buf, w-buf);
+		http_server_send(request->socket, p, size);
+		return 0;
+	}
 	//TODO: SSI対応.
-	http_server_send(request->socket, ptr, end-ptr);
-	return 0;
+	return 503;
 }
 
 static int
