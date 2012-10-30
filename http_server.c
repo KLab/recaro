@@ -2,6 +2,7 @@
 #include <linux/kthread.h>
 #include <linux/tcp.h>
 #include "tkhttpd.h"
+#include "kmemcached.h"
 
 #define CRLF "\r\n"
 
@@ -155,6 +156,15 @@ static int
 http_server_response (struct http_request *request, int keep_alive) {
 	char *response;
 
+	if (request->method == HTTP_GET) {
+		item_t *item = get_item(request->request_url, strlen(request->request_url));
+		if (item) {
+			http_server_send(request->socket, item->data, item->size);
+			release_item(item);
+			return 0;
+		}
+	}
+
 	printk(KERN_INFO MODULE_NAME ": request_url = %s\n", request->request_url);
 	if (request->method != HTTP_GET) {
 		response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
@@ -285,3 +295,5 @@ http_server_daemon (void *arg) {
 	}
 	return 0;
 }
+
+/* vim: set sw=8 ts=8 noexpandtab :*/
