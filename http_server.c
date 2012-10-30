@@ -196,8 +196,44 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 		http_server_send(request->socket, p, size, 0);
 		return 0;
 	}
-	//TODO: SSI対応.
-	return 503;
+	else {
+		int cur;
+		if (*keep_alive) {
+			w += sprintf(w, "Connection: keep-alive\r\n");
+		}
+		w += sprintf(w, "Transfer-Encoding: chunked\r\n\r\n");
+		http_server_send(request->socket, buf, w-buf, 1);
+
+		for (cur=0; cur<nchunk; ++cur) {
+			// chunkサイズは chunked encoding にならって 16進
+			long size = simple_strtol(p, &q, 16);
+			memcpy(buf, p, q-p);
+			http_server_send(request->socket, buf, q-p, 1);
+			p = q = q+2;
+			http_server_send(request->socket, p, size, 1);
+			p = q = q + size;
+			http_server_send(request->socket, CRLF, 2, 1);
+
+			if (cur+1 < nchunk) {
+				item_t *subitem;
+				int size;
+				// TODO: SSIの入れ子に対応.
+				while (*q != '\r') {
+					q++;
+				}
+				subitem = get_item(p, q-p);
+				if (subitem == NULL) {
+					continue;
+				}
+				size = sprintf(buf, "%lx\r\n", subitem->size);
+				http_server_send(request->socket, buf, size, 1);
+				http_server_send(request->socket, subitem->data, subitem->size, 1);
+				http_server_send(request->socket, CRLF, 2, 1);
+				release_item(subitem);
+			}
+		}
+		return 503;
+	}
 }
 
 static int
