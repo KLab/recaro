@@ -10,6 +10,7 @@
 #include <linux/tcp.h>
 #include <net/sock.h>
 #include "tkhttpd.h"
+#include "kmemcached.h"
 
 #define DEFAULT_PORT 80
 #define DEFAULT_PROC 20
@@ -115,7 +116,8 @@ tkhttpd_init (void) {
 		close_listen_socket(listen_socket);
 		return PTR_ERR(http_server);
 	}
-	return 0;
+
+	return kmemcached_init();
 }
 
 void __exit
@@ -123,6 +125,7 @@ tkhttpd_exit (void) {
 	send_sig(SIGTERM, http_server, 1);
 	kthread_stop(http_server);
 	close_listen_socket(listen_socket);
+	kmemcached_exit();
 	printk(KERN_INFO MODULE_NAME ": module unloaded\n");
 }
 
@@ -132,3 +135,5 @@ module_exit(tkhttpd_exit);
 MODULE_DESCRIPTION("Tiny Kernel module based HTTP Daemon.");
 MODULE_AUTHOR("Masaya YAMAMOTO <yamamoto-ma@klab.com>");
 MODULE_LICENSE("Dual BSD/GPL");
+
+/* vim: set ts=8 sw=8 noexpandtab : */
