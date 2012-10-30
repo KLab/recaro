@@ -1,4 +1,5 @@
-tkhttpd
+recaro
 =======
 
-Tiny Kernel module based HTTP Daemon
+High speed web server kernel module for ISUCON.
+
