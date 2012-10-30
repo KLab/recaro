@@ -152,19 +152,55 @@ http_server_send (struct socket *sock, const char *buf, size_t size) {
 	return done;
 }
 
+
+static int
+response_from_item(item_t *item, struct http_request *request, int *keep_alive) {
+	char *ptr, *end;
+	ptr = item->data;
+	end = ptr + item->size;
+	//TODO: SSI対応.
+	http_server_send(request->socket, ptr, end-ptr);
+	return 0;
+}
+
+static int
+do_get (struct http_request *request, int *keep_alive) {
+	item_t *item = get_item(request->request_url, strlen(request->request_url));
+	if (item) {
+		int status = response_from_item(item, request, keep_alive);
+		release_item(item);
+		return status;
+	}
+	// TODO: reverse proxy.
+	return 404;
+}
+
+static int
+do_post (struct http_request *request, int *keep_alive) {
+	// TODO: reverse proxy.
+	return 501;
+}
+
 static int
 http_server_response (struct http_request *request, int keep_alive) {
 	char *response;
+	int status;
 
-	if (request->method == HTTP_GET) {
-		item_t *item = get_item(request->request_url, strlen(request->request_url));
-		if (item) {
-			http_server_send(request->socket, item->data, item->size);
-			release_item(item);
-			return 0;
-		}
+	switch (request->method) {
+	case HTTP_GET:
+		status = do_get(request, &keep_alive);
+		break;
+	case HTTP_POST:
+		status = do_post(request, &keep_alive);
+		break;
+	default:
+		// 405 Method Not Allowed
+		status = 405;
 	}
+	if (status == 0)
+		return 0; //response has sent already.
 
+	//TODO: ret が 0 以外の場合は、そのステータスコードに応じたデフォルトのレスポンスを返す.
 	printk(KERN_INFO MODULE_NAME ": request_url = %s\n", request->request_url);
 	if (request->method != HTTP_GET) {
 		response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
