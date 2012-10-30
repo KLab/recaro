@@ -125,17 +125,13 @@ http_server_recv (struct socket *sock, char *buf, size_t size) {
 }
 
 static int
-http_server_send (struct socket *sock, const char *buf, size_t size) {
+http_server_send (struct socket *sock, const char *buf, size_t size, int more) {
 	mm_segment_t oldfs;
 	struct iovec iov;
 	struct msghdr msg = {
-		.msg_name = NULL,
-		.msg_namelen = 0,
 		.msg_iov = &iov,
 		.msg_iovlen = 1,
-		.msg_control = NULL,
-		.msg_controllen = 0,
-		.msg_flags = 0
+		.msg_flags = more ? MSG_MORE : 0
 	};
 	int length, done = 0;
 
@@ -196,8 +192,8 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 			w += sprintf(w, "Connection: keep-alive\r\n");
 		}
 		w += sprintf(w, "Content-Length: %ld\r\n\r\n", size);
-		http_server_send(request->socket, buf, w-buf);
-		http_server_send(request->socket, p, size);
+		http_server_send(request->socket, buf, w-buf, 1);
+		http_server_send(request->socket, p, size, 0);
 		return 0;
 	}
 	//TODO: SSI対応.
@@ -248,7 +244,7 @@ http_server_response (struct http_request *request, int keep_alive) {
 	} else {
 		response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY : HTTP_RESPONSE_200_DUMMY;
 	}
-	http_server_send(request->socket, response, strlen(response));
+	http_server_send(request->socket, response, strlen(response), 0);
 	return 0;
 }
 
