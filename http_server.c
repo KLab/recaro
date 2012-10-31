@@ -91,11 +91,17 @@
 #define CONTENT_LENGTH "Content-Length: "
 
 #define RECV_BUFFER_SIZE 4096
+#define SEND_BUFFER_SIZE 4096
+
+#define STRANDSIZE(S) S, strlen(S)
+#define STRAPPEND(X, S) do { memcpy(X, S, strlen(S)); X += strlen(S); } while (0)
 
 struct http_request {
 	struct socket *socket;
 	enum http_method method;
 	char request_url[128];
+	char *send_buf;
+	int send_bufsize;
 	int complete;
 };
 
@@ -151,13 +157,67 @@ http_server_send (struct socket *sock, const char *buf, size_t size, int more) {
 	return done;
 }
 
+static int
+response_flush(struct http_request *request, int more) {
+	int ret = http_server_send(request->socket,
+			request->send_buf, request->send_bufsize, more);
+	request->send_bufsize = 0;
+	return ret;
+}
+
+static int
+response_write(struct http_request *request, void *buf, size_t len, int more) {
+	int ret;
+	//printk("response_write: sendbuf=%p(%ld) buf=%p(%ld) more=%d\n",
+	//       request->send_buf, request->send_bufsize, buf, len, more);
+	if (len < 200 && len + request->send_bufsize < SEND_BUFFER_SIZE) {
+		memcpy(request->send_buf + request->send_bufsize, buf, len);
+		request->send_bufsize += len;
+		if (more) {
+			return 0;
+		} else {
+			return response_flush(request, more);
+		}
+	} else {
+		ret = response_flush(request, 1);
+		if (ret < 0) return ret;
+		if (len < 200 && more) {
+			memcpy(request->send_buf, buf, len);
+			request->send_bufsize = len;
+			return ret;
+		} else {
+			return http_server_send(request->socket, buf, len, more);
+		}
+	}
+}
+
+static int
+response_printf(struct http_request *request, int more, const char *fmt, ...) {
+	va_list args;
+	int ret=0;
+	if (SEND_BUFFER_SIZE - request->send_bufsize < 1024) {
+		ret = response_flush(request, 1);
+		if (ret < 0) return ret;
+	}
+	va_start(args, fmt);
+	ret = vsprintf(request->send_buf + request->send_bufsize, fmt, args);
+	va_end(args);
+	request->send_bufsize += ret;
+	if (!more) {
+		return response_flush(request, 0);
+	}
+	return ret;
+}
+
 
 static int
 response_from_item(item_t *item, struct http_request *request, int *keep_alive) {
 	char *start, *p, *q, *end;
-	char buf[128] = "HTTP/1.1 200 OK\r\n";
-	char *w = buf + strlen(buf);
+	char buf[128];
+	char *w = buf;
 	long nchunk;
+
+	STRAPPEND(w, "HTTP/1.1 200 OK\r\n");
 
 	start = p = item->data;
 	end = start + item->size;
@@ -171,7 +231,7 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 			return 503;
 		}
 	}
-	strcpy(w, CONTENT_TYPE); w += strlen(CONTENT_TYPE);
+	STRAPPEND(w, CONTENT_TYPE);
 	memcpy(w, p, q-p); w += q-p;
 	*w++ = '\r';
 	*w++ = '\n';
@@ -184,35 +244,34 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 		printk("BUG: nchunk=%ld\n", nchunk);
 		return 503;
 	}
-	else if (nchunk == 1) {
+
+	if (*keep_alive) {
+		STRAPPEND(w, "Connection: keep-alive\r\n");
+	}
+	// こっから先は後戻りできない.
+	response_write(request, buf, w-buf, 1);
+	w = buf;
+	if (nchunk == 1) {
 		// simple response.
 		// chunkサイズは chunked encoding にならって 16進
 		long size = simple_strtol(p, &q, 16); p = q = q+2;
-		if (*keep_alive) {
-			w += sprintf(w, "Connection: keep-alive\r\n");
-		}
-		w += sprintf(w, "Content-Length: %ld\r\n\r\n", size);
-		http_server_send(request->socket, buf, w-buf, 1);
-		http_server_send(request->socket, p, size, 0);
+		response_printf(request, 1,
+				"Content-Length: %ld\r\n\r\n", size);
+		response_write(request, p, size, 0);
 		return 0;
 	}
 	else {
 		int cur;
-		if (*keep_alive) {
-			w += sprintf(w, "Connection: keep-alive\r\n");
-		}
-		w += sprintf(w, "Transfer-Encoding: chunked\r\n\r\n");
-		http_server_send(request->socket, buf, w-buf, 1);
-		//printk("start sending %ld chunks\n", nchunk);
+		response_write(request,
+				STRANDSIZE("Transfer-Encoding: chunked\r\n\r\n"), 1);
 
 		for (cur=0; cur<nchunk; ++cur) {
 			long size = simple_strtol(p, &q, 16);
 			//printk("chunk size: %ld\n", size);
 			p = q = q + 2;
-			w = buf + sprintf(buf, "%lx\r\n", size);
-			http_server_send(request->socket, buf, w-buf, 1);
-			http_server_send(request->socket, p, size, 1);
-			http_server_send(request->socket, CRLF, 2, 1);
+			response_printf(request, 1, "%lx\r\n", size);
+			response_write(request, p, size, 1);
+			response_write(request, CRLF, 2, 1);
 			p = q = q + size + 2;
 
 			if (cur+1 < nchunk) {
@@ -222,8 +281,8 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 					q++;
 				}
 				subitem = get_item(p, q-p);
-				strncpy(buf, p, q-p);
-				buf[q-p] = '\0';
+				//strncpy(buf, p, q-p);
+				//buf[q-p] = '\0';
 				//printk("loading '%s'\n", buf);
 				p = q = q+2;
 				if (subitem == NULL) {
@@ -231,14 +290,13 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 					continue;
 				}
 				//printk("ssi chunk size: %ld\n", subitem->size);
-				size = sprintf(buf, "%lx\r\n", subitem->size);
-				http_server_send(request->socket, buf, size, 1);
-				http_server_send(request->socket, subitem->data, subitem->size, 1);
-				http_server_send(request->socket, CRLF, 2, 1);
+				response_printf(request, 1, "%lx\r\n", subitem->size);
+				response_write(request, subitem->data, subitem->size, 1);
+				response_write(request, CRLF, 2, 1);
 				release_item(subitem);
 			}
 		}
-		http_server_send(request->socket, "0\r\n\r\n", 5, 0);
+		response_write(request, STRANDSIZE("0\r\n\r\n"), 0);
 		return 0;
 	}
 }
@@ -295,8 +353,10 @@ static int
 http_parser_callback_message_begin (http_parser *parser) {
 	struct http_request *request = parser->data;
 	struct socket *socket = request->socket;
+	char *sndbuf = request->send_buf;
 	memset(request, 0x00, sizeof(struct http_request));
 	request->socket = socket;
+	request->send_buf = sndbuf;
 	return 0;
 }
 
@@ -362,6 +422,13 @@ http_server_worker (void *arg) {
 		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
 		return -1;
 	}
+	request.send_buf = kmalloc(SEND_BUFFER_SIZE, GFP_KERNEL);
+	if (!request.send_buf) {
+		kfree(buf);
+		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
+		return -1;
+	}
+	request.send_bufsize = 0;
 	request.socket = socket;
 	http_parser_init(&parser, HTTP_REQUEST);
 	parser.data = &request;
@@ -380,6 +447,7 @@ http_server_worker (void *arg) {
 	}
 	kernel_sock_shutdown(socket, SHUT_RDWR);
 	sock_release(socket);
+	kfree(request.send_buf);
 	kfree(buf);
 	return 0;
 }
