@@ -96,10 +96,21 @@
 #define STRANDSIZE(S) S, strlen(S)
 #define STRAPPEND(X, S) do { memcpy(X, S, strlen(S)); X += strlen(S); } while (0)
 
+struct http_header {
+	char name[128];
+	char value[1024];
+};
+
 struct http_request {
 	struct socket *socket;
+	struct socket *proxy_socket;
 	enum http_method method;
 	char request_url[128];
+	int num_headers;
+	enum { NONE=0, FIELD, VALUE } last_header_element;
+	struct http_header headers[32];
+	char raw_header[1024];
+	char *recv_buf;
 	char *send_buf;
 	int send_bufsize;
 	int complete;
@@ -302,6 +313,103 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 }
 
 static int
+open_client_socket (const char *addr, ushort port, struct socket **res) {
+	struct socket *sock;
+	int err, opt = 1;
+	struct sockaddr_in s;
+
+	err = sock_create_kern(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+	if (err < 0) {
+		printk(KERN_ERR MODULE_NAME ": sock_create_kern() failure, err=%d\n", err);
+		return err;
+	}
+	opt = 1;
+	err = kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY, (char *)&opt, sizeof(opt));
+	if (err < 0) {
+		printk(KERN_ERR MODULE_NAME ": kernel_setsockopt() failure, err=%d\n", err);
+		sock_release(sock);
+		return err;
+	}
+	opt = 0;
+	err = kernel_setsockopt(sock, SOL_TCP, TCP_CORK, (char *)&opt, sizeof(opt));
+	if (err < 0) {
+		printk(KERN_ERR MODULE_NAME ": kernel_setsockopt() failure, err=%d\n", err);
+		sock_release(sock);
+		return err;
+	}
+	opt = 1024 * 1024;
+	err = kernel_setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&opt, sizeof(opt));
+	if (err < 0) {
+		printk(KERN_ERR MODULE_NAME ": kernel_setsockopt() failure, err=%d\n", err);
+		sock_release(sock);
+		return err;
+	}
+	opt = 1024 * 1024;
+	err = kernel_setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char *)&opt, sizeof(opt));
+	if (err < 0) {
+		printk(KERN_ERR MODULE_NAME ": kernel_setsockopt() failure, err=%d\n", err);
+		sock_release(sock);
+		return err;
+	}
+	memset(&s, 0, sizeof(s));
+	s.sin_family = AF_INET;
+	s.sin_addr.s_addr = in_aton(addr);
+	s.sin_port = htons(port);
+	err = kernel_connect(sock, (struct sockaddr *) &s, sizeof(s), 0);
+	if (err < 0) {
+		printk(KERN_ERR MODULE_NAME ": kernel_connect() failure, err=%d\n", err);
+		sock_release(sock);
+		return err;
+	}
+	*res = sock;
+	return 0;
+}
+
+static void
+close_client_socket (struct socket *socket) {
+	kernel_sock_shutdown(socket, SHUT_RDWR);
+	sock_release(socket);
+}
+
+static int
+redirect_response (struct http_request *request) {
+	char buf[1500];
+	int len;
+	while (1) {
+		len = http_server_recv(request->proxy_socket, buf, sizeof(buf));
+		if (len <= 0) {
+			break;
+		}
+		http_server_send(request->socket, buf, len, 1);
+	}
+	return 0;
+}
+
+static int
+redirect_get_request (struct http_request *request) {
+	char buf[1024];
+	int err, len, count;
+	if (!request->proxy_socket)	{
+		err = open_client_socket("127.0.0.1", 8080, &request->proxy_socket);
+		if (err < 0) {
+			printk(KERN_ERR MODULE_NAME ": can't open client socket!\n");
+			return 500;
+		}
+	}
+	len = snprintf(buf, sizeof(buf), "GET %s HTTP/1.1\r\n", request->request_url);
+	http_server_send(request->proxy_socket, buf, len, 1);
+	for (count = 0; count < request->num_headers; count++) {
+		if (strcmp(request->headers[count].name, "Connection") == 0) {
+			continue;
+		}
+		len = snprintf(buf, sizeof(buf), "%s: %s\r\n", request->headers[count].name, request->headers[count].value);
+		http_server_send(request->proxy_socket, buf, len, 1);
+	}
+	http_server_send(request->proxy_socket, "Connection: Close\r\n\r\n", 21, 0);
+	return redirect_response(request);
+}
+
+static int
 do_get (struct http_request *request, int *keep_alive) {
 	item_t *item = get_item(request->request_url, strlen(request->request_url));
 	if (item) {
@@ -309,14 +417,12 @@ do_get (struct http_request *request, int *keep_alive) {
 		release_item(item);
 		return status;
 	}
-	// TODO: reverse proxy.
-	return 404;
+	return redirect_get_request(request);
 }
 
 static int
 do_post (struct http_request *request, int *keep_alive) {
-	// TODO: reverse proxy.
-	return 501;
+	return redirect_response(request);
 }
 
 static int
@@ -353,9 +459,11 @@ static int
 http_parser_callback_message_begin (http_parser *parser) {
 	struct http_request *request = parser->data;
 	struct socket *socket = request->socket;
+	struct socket *proxy_socket = request->proxy_socket;
 	char *sndbuf = request->send_buf;
 	memset(request, 0x00, sizeof(struct http_request));
 	request->socket = socket;
+	request->proxy_socket = proxy_socket;
 	request->send_buf = sndbuf;
 	return 0;
 }
@@ -369,23 +477,57 @@ http_parser_callback_request_url (http_parser *parser, const char *p, size_t len
 
 static int
 http_parser_callback_header_field (http_parser *parser, const char *p, size_t len) {
+	struct http_request *request = parser->data;
+	if (request->last_header_element != FIELD) {
+		request->num_headers++;
+	}
+	strncat(request->headers[request->num_headers - 1].name, p, len);
+	request->last_header_element = FIELD;
 	return 0;
 }
 
 static int
 http_parser_callback_header_value (http_parser *parser, const char *p, size_t len) {
+	struct http_request *request = parser->data;
+	strncat(request->headers[request->num_headers - 1].value, p, len);
+	request->last_header_element = VALUE;
 	return 0;
 }
 
 static int
 http_parser_callback_headers_complete (http_parser *parser) {
 	struct http_request *request = parser->data;
-	request->method = parser->method;	
+	int err, len, count;
+	char buf[1024];
+	request->method = parser->method;
+	if (request->method == HTTP_POST) {
+		if (!request->proxy_socket)	{
+			err = open_client_socket("127.0.0.1", 8080, &request->proxy_socket);
+			if (err < 0) {
+				printk(KERN_ERR MODULE_NAME ": can't open client socket!\n");
+				return 0;
+			}
+		}
+		len = snprintf(buf, sizeof(buf), "POST %s HTTP/1.1\r\n", request->request_url);
+		http_server_send(request->proxy_socket, buf, len, 1);
+		for (count = 0; count < request->num_headers; count++) {
+			if (strcmp(request->headers[count].name, "Connection") == 0) {
+				continue;
+			}
+			len = snprintf(buf, sizeof(buf), "%s: %s\r\n", request->headers[count].name, request->headers[count].value);
+			http_server_send(request->proxy_socket, buf, len, 1);
+		}
+		http_server_send(request->proxy_socket, "Connection: Close\r\n\r\n", 21, 0);
+	}
 	return 0;
 }
 
 static int
 http_parser_callback_body (http_parser *parser, const char *p, size_t len) {
+	struct http_request *request = parser->data;
+	if (request->method == HTTP_POST) {
+		http_server_send(request->proxy_socket, p, len, 0);
+	}
 	return 0;
 }
 
@@ -393,6 +535,11 @@ static int
 http_parser_callback_message_complete (http_parser *parser) {
 	struct http_request *request = parser->data;
 	http_server_response(request, http_should_keep_alive(parser));
+	if (request->proxy_socket) {
+		kernel_sock_shutdown(request->proxy_socket, SHUT_RDWR);
+		sock_release(request->proxy_socket);
+		request->proxy_socket = NULL;
+	}
 	request->complete = 1;
 	return 0;
 }
@@ -400,7 +547,6 @@ http_parser_callback_message_complete (http_parser *parser) {
 static int
 http_server_worker (void *arg) {
 	struct socket *socket;
-	char *buf;
 	int ret;
 	struct http_parser parser;
 	struct http_parser_settings setting = {
@@ -412,43 +558,56 @@ http_server_worker (void *arg) {
 		.on_body = http_parser_callback_body,
 		.on_message_complete = http_parser_callback_message_complete
 	};
-	struct http_request request;
+	struct http_request *request;
 
 	socket = (struct socket *)arg;
 	allow_signal(SIGKILL);
 	allow_signal(SIGTERM);
-	buf = kmalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
-	if (!buf) {
+	request = kmalloc(sizeof(struct http_request), GFP_KERNEL);
+	if (!request) {
 		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
 		return -1;
 	}
-	request.send_buf = kmalloc(SEND_BUFFER_SIZE, GFP_KERNEL);
-	if (!request.send_buf) {
-		kfree(buf);
+	request->recv_buf = kmalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
+	if (!request->recv_buf) {
+		kfree(request);
 		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
 		return -1;
 	}
-	request.send_bufsize = 0;
-	request.socket = socket;
+	request->send_buf = kmalloc(SEND_BUFFER_SIZE, GFP_KERNEL);
+	if (!request->send_buf) {
+		kfree(request->recv_buf);
+		kfree(request);
+		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
+		return -1;
+	}
+	request->send_bufsize = 0;
+	request->socket = socket;
+	request->proxy_socket = NULL;
 	http_parser_init(&parser, HTTP_REQUEST);
-	parser.data = &request;
+	parser.data = request;
 	while (!kthread_should_stop()) {
-		ret = http_server_recv(socket, buf, RECV_BUFFER_SIZE - 1);
+		ret = http_server_recv(socket, request->recv_buf, RECV_BUFFER_SIZE - 1);
 		if (ret <= 0) {
 			if (ret) {
 				printk(KERN_ERR MODULE_NAME ": recv error: %d\n", ret);
 			}
 			break;
 		}
-		http_parser_execute(&parser, &setting, buf, ret);
-		if (request.complete && !http_should_keep_alive(&parser)) {
+		http_parser_execute(&parser, &setting, request->recv_buf, ret);
+		if (request->complete && !http_should_keep_alive(&parser)) {
 			break;
 		}
 	}
 	kernel_sock_shutdown(socket, SHUT_RDWR);
 	sock_release(socket);
-	kfree(request.send_buf);
-	kfree(buf);
+	if (request->proxy_socket) {
+		kernel_sock_shutdown(request->proxy_socket, SHUT_RDWR);
+		sock_release(request->proxy_socket);
+	}
+	kfree(request->send_buf);
+	kfree(request->recv_buf);
+	kfree(request);
 	return 0;
 }
 
