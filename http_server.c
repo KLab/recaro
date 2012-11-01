@@ -94,8 +94,7 @@
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE (16*1024)
 
-#define STRANDSIZE(S) S, strlen(S)
-#define STRAPPEND(X, S) do { memcpy(X, S, strlen(S)); X += strlen(S); } while (0)
+#define STRANDSIZE(S) S, (sizeof(S)-1)
 
 struct http_header {
 	char name[128];
@@ -159,7 +158,8 @@ http_server_send (struct socket *sock, const char *buf, size_t size, int more) {
 		iov.iov_len = size - done;
 		length = sock_sendmsg(sock, &msg, iov.iov_len);
 		if (length < 0) {
-			printk(KERN_ERR MODULE_NAME ": write error: %d\n", length);
+			printk(KERN_ERR MODULE_NAME ": write error: %d done=%d\n", length, done);
+			printk(KERN_ERR MODULE_NAME ": buf=%p, size=%d, more=%d\n", buf, size, more);
 			break;
 		}
 		done += length;
@@ -168,7 +168,7 @@ http_server_send (struct socket *sock, const char *buf, size_t size, int more) {
 	return done;
 }
 
-static int
+static inline int
 response_flush(struct http_request *request, int more) {
 	int ret = http_server_send(request->socket,
 			request->send_buf, request->send_bufsize, more);
@@ -177,10 +177,7 @@ response_flush(struct http_request *request, int more) {
 }
 
 static int
-response_write(struct http_request *request, void *buf, size_t len, int more) {
-	int ret;
-	//printk("response_write: sendbuf=%p(%ld) buf=%p(%ld) more=%d\n",
-	//       request->send_buf, request->send_bufsize, buf, len, more);
+response_write(struct http_request *request, void *buf, int len, int more) {
 	if (len < 512 && len + request->send_bufsize < SEND_BUFFER_SIZE) {
 		memcpy(request->send_buf + request->send_bufsize, buf, len);
 		request->send_bufsize += len;
@@ -190,7 +187,7 @@ response_write(struct http_request *request, void *buf, size_t len, int more) {
 			return response_flush(request, more);
 		}
 	} else {
-		ret = response_flush(request, 1);
+		int ret = response_flush(request, 1);
 		if (ret < 0) return ret;
 		if (len < 512 && more) {
 			memcpy(request->send_buf, buf, len);
@@ -244,11 +241,11 @@ ssi_include(struct http_request *request, char *arg, char *end)
 
 static int
 response_from_item(item_t *item, struct http_request *request, int *keep_alive) {
-	char *start, *p, *q, *end;
-	int ssi=0;
+	char *p, *q, *end;
+	int ssi;
 
-	start = p = item->data;
-	end = start + item->size;
+	p = item->data;
+	end = p + item->size;
 
 	// 1行目: content_type
 	q = p;
@@ -259,20 +256,20 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 			return 503;
 		}
 	}
+	// content-type が text/html の時だけSSIが有効になる.
+	ssi = strncmp("text/html", p, 9) == 0;
+	q += 2;
 	// Note: 512byte以上 write すると本当に送信してしまうので fallback 不可能になる.
 	response_write(request, STRANDSIZE("HTTP/1.1 200 OK\r\n"), 1);
 	if (*keep_alive) {
 		response_write(request, STRANDSIZE("Connection: keep-alive\r\n"), 1);
+	} else {
+		response_write(request, STRANDSIZE("Connection: close\r\n"), 1);
 	}
 	response_write(request, STRANDSIZE("Content-Type: "), 1);
 	response_write(request, p, q-p, 1);
-	response_write(request, STRANDSIZE("\r\n"), 1);
 
-	// content-type が text/html の時だけSSIが有効になる.
-	if (0 == strncmp("text/html", p, 9)) {
-		ssi = 1;
-	}
-	p = q + 2; // skip \r\n
+	p = q;
 
 	if (ssi) {
 		q = strnstr(p, "<!--#", end-p);
@@ -282,11 +279,13 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 	}
 
 	if (!ssi) {
-		// simple response.
-		// chunkサイズは chunked encoding にならって 16進
-		response_printf(request, 1,
-				"Content-Length: %ld\r\n\r\n", end-p);
-		response_write(request, p, end-p, 0);
+		int size = end-p;
+		if (size < 0) {
+			printk("BUG ON %s %d\n", __FILE__, __LINE__);
+			return 404;
+		}
+		response_printf(request, 1, "Content-Length: %d\r\n\r\n", size);
+		response_write(request, p, size, 0);
 		return 0;
 	}
 	else {
@@ -476,7 +475,8 @@ static int
 http_parser_callback_message_begin (http_parser *parser) {
 	struct http_request *request = parser->data;
 	request->method = 0;
-	request->request_url[0]='\0';
+	memset(request->request_url, 0, sizeof(request->request_url));
+	memset(request->headers, 0, sizeof(request->headers));
 	request->num_headers = 0;
 	request->last_header_element = 0;
 	request->send_bufsize = 0;
