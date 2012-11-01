@@ -1,6 +1,7 @@
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/tcp.h>
+#include <linux/string.h>
 #include "tkhttpd.h"
 #include "kmemcached.h"
 
@@ -91,7 +92,7 @@
 #define CONTENT_LENGTH "Content-Length: "
 
 #define RECV_BUFFER_SIZE 4096
-#define SEND_BUFFER_SIZE 4096
+#define SEND_BUFFER_SIZE (16*1024)
 
 #define STRANDSIZE(S) S, strlen(S)
 #define STRAPPEND(X, S) do { memcpy(X, S, strlen(S)); X += strlen(S); } while (0)
@@ -180,7 +181,7 @@ response_write(struct http_request *request, void *buf, size_t len, int more) {
 	int ret;
 	//printk("response_write: sendbuf=%p(%ld) buf=%p(%ld) more=%d\n",
 	//       request->send_buf, request->send_bufsize, buf, len, more);
-	if (len < 200 && len + request->send_bufsize < SEND_BUFFER_SIZE) {
+	if (len < 512 && len + request->send_bufsize < SEND_BUFFER_SIZE) {
 		memcpy(request->send_buf + request->send_bufsize, buf, len);
 		request->send_bufsize += len;
 		if (more) {
@@ -191,7 +192,7 @@ response_write(struct http_request *request, void *buf, size_t len, int more) {
 	} else {
 		ret = response_flush(request, 1);
 		if (ret < 0) return ret;
-		if (len < 200 && more) {
+		if (len < 512 && more) {
 			memcpy(request->send_buf, buf, len);
 			request->send_bufsize = len;
 			return ret;
@@ -219,15 +220,32 @@ response_printf(struct http_request *request, int more, const char *fmt, ...) {
 	return ret;
 }
 
+static inline int
+response_write_chunk(struct http_request *request, char *buf, int len)
+{
+	response_printf(request, 1, "%lx\r\n", len);
+	response_write(request, buf, len, 1);
+	response_write(request, CRLF, 2, len==0);
+	return 0;
+}
+
+static int 
+ssi_include(struct http_request *request, char *arg, char *end)
+{
+	item_t *item = get_item(arg, end-arg);
+	if (item == NULL) {
+		printk("item not found.\n");
+		return 0;
+	}
+	response_write_chunk(request, item->data, item->size);
+	release_item(item);
+	return 0;
+}
 
 static int
 response_from_item(item_t *item, struct http_request *request, int *keep_alive) {
 	char *start, *p, *q, *end;
-	char buf[128];
-	char *w = buf;
-	long nchunk;
-
-	STRAPPEND(w, "HTTP/1.1 200 OK\r\n");
+	int ssi=0;
 
 	start = p = item->data;
 	end = start + item->size;
@@ -241,72 +259,72 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 			return 503;
 		}
 	}
-	STRAPPEND(w, CONTENT_TYPE);
-	memcpy(w, p, q-p); w += q-p;
-	*w++ = '\r';
-	*w++ = '\n';
-	p = q = q + 2; // skip \r\n
-
-	// 2行目チャンク数.
-	nchunk = simple_strtol(p, &q, 10); p = q = q + 2;
-
-	if (nchunk <= 0) {
-		printk("BUG: nchunk=%ld\n", nchunk);
-		return 503;
-	}
-
+	// Note: 512byte以上 write すると本当に送信してしまうので fallback 不可能になる.
+	response_write(request, STRANDSIZE("HTTP/1.1 200 OK\r\n"), 1);
 	if (*keep_alive) {
-		STRAPPEND(w, "Connection: keep-alive\r\n");
+		response_write(request, STRANDSIZE("Connection: keep-alive\r\n"), 1);
 	}
-	// こっから先は後戻りできない.
-	response_write(request, buf, w-buf, 1);
-	w = buf;
-	if (nchunk == 1) {
+	response_write(request, STRANDSIZE("Content-Type: "), 1);
+	response_write(request, p, q-p, 1);
+	response_write(request, STRANDSIZE("\r\n"), 1);
+
+	// content-type が text/html の時だけSSIが有効になる.
+	if (0 == strncmp("text/html", p, 9)) {
+		ssi = 1;
+	}
+	p = q + 2; // skip \r\n
+
+	if (ssi) {
+		q = strnstr(p, "<!--#", end-p);
+		if (!q) {
+			ssi = 0;
+		}
+	}
+
+	if (!ssi) {
 		// simple response.
 		// chunkサイズは chunked encoding にならって 16進
-		long size = simple_strtol(p, &q, 16); p = q = q+2;
 		response_printf(request, 1,
-				"Content-Length: %ld\r\n\r\n", size);
-		response_write(request, p, size, 0);
+				"Content-Length: %ld\r\n\r\n", end-p);
+		response_write(request, p, end-p, 0);
 		return 0;
 	}
 	else {
-		int cur;
-		response_write(request,
-				STRANDSIZE("Transfer-Encoding: chunked\r\n\r\n"), 1);
-
-		for (cur=0; cur<nchunk; ++cur) {
-			long size = simple_strtol(p, &q, 16);
-			//printk("chunk size: %ld\n", size);
-			p = q = q + 2;
-			response_printf(request, 1, "%lx\r\n", size);
-			response_write(request, p, size, 1);
-			response_write(request, CRLF, 2, 1);
-			p = q = q + size + 2;
-
-			if (cur+1 < nchunk) {
-				item_t *subitem;
-				// TODO: SSIの入れ子に対応.
-				while (*q != '\r') {
-					q++;
-				}
-				subitem = get_item(p, q-p);
-				//strncpy(buf, p, q-p);
-				//buf[q-p] = '\0';
-				//printk("loading '%s'\n", buf);
-				p = q = q+2;
-				if (subitem == NULL) {
-					printk("can't load subitem.\n");
-					continue;
-				}
-				//printk("ssi chunk size: %ld\n", subitem->size);
-				response_printf(request, 1, "%lx\r\n", subitem->size);
-				response_write(request, subitem->data, subitem->size, 1);
-				response_write(request, CRLF, 2, 1);
-				release_item(subitem);
+		response_write(request, STRANDSIZE("Transfer-Encoding: chunked\r\n\r\n"), 1);
+		//TODO: 関数に切り出して include の再帰に対応する.
+		while (p < end) {
+			long size;
+			char *r;
+			if (!q) q = end;
+			size = q-p;
+			response_write_chunk(request, p, size);
+			if (q == end) break;
+			p = q;
+			q = strnstr(q, "-->", end-q);
+			if (!q) {
+				printk("ssi error. no much -->\n");
+				response_write_chunk(request, p, end-p);
+				p = end;
+				break;
 			}
+			p += 5; //skip "<!--#"
+			while (p[0] == ' ') p++;
+			r = q;
+			while (r[-1] == ' ') r--;
+
+			if (p < r) {
+				if (0 == strncmp("include", p, 7)) {
+					p += 7;
+					while (p[0] == ' ') p++;
+					ssi_include(request, p, r);
+				}
+				//TODO: support other commands.
+			}
+
+			p = q + 3; // skip "-->"
+			q = strnstr(p, "<--#", end-p);
 		}
-		response_write(request, STRANDSIZE("0\r\n\r\n"), 0);
+		response_write_chunk(request, "", 0);
 		return 0;
 	}
 }
