@@ -106,7 +106,7 @@ struct http_request {
 	struct socket *socket;
 	struct socket *proxy_socket;
 	enum http_method method;
-	char request_url[128];
+	char request_url[4096];
 	int num_headers;
 	enum { NONE=0, FIELD, VALUE } last_header_element;
 	struct http_header headers[32];
@@ -119,27 +119,13 @@ struct http_request {
 
 static int
 http_server_recv (struct socket *sock, char *buf, size_t size) {
-	mm_segment_t oldfs;
-	struct iovec iov = {
+	struct kvec iov = {
 		.iov_base = (void *)buf,
 		.iov_len = size
 	};
-	struct msghdr msg = {
-		.msg_name = 0,
-		.msg_namelen = 0,
-		.msg_iov = &iov,
-		.msg_iovlen = 1,
-		.msg_control = NULL,
-		.msg_controllen = 0,
-		.msg_flags = 0
-	};
-	int length = 0;
+	struct msghdr msg = {};
 
-	oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	length = sock_recvmsg(sock, &msg, size, msg.msg_flags);
-	set_fs(oldfs);
-	return length;
+	return kernel_recvmsg(sock, &msg, &iov, 1, size, 0);
 }
 
 static int
@@ -389,6 +375,9 @@ redirect_response (struct http_request *request) {
 	while (1) {
 		len = http_server_recv(request->proxy_socket, request->temp_buf, sizeof(request->temp_buf));
 		if (len <= 0) {
+			if (len) {
+				printk(KERN_ERR MODULE_NAME ": recv error: %d\n", len);
+			}
 			break;
 		}
 		http_server_send(request->socket, request->temp_buf, len, 1);
@@ -470,7 +459,6 @@ http_parser_callback_message_begin (http_parser *parser) {
 	struct http_request *request = parser->data;
 	request->method = 0;
 	request->request_url[0] = 0;
-	memset(request->headers, 0, sizeof(request->headers));
 	request->num_headers = 0;
 	request->last_header_element = 0;
 	request->send_bufsize = 0;
