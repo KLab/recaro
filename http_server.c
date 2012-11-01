@@ -109,7 +109,6 @@ struct http_request {
 	int num_headers;
 	enum { NONE=0, FIELD, VALUE } last_header_element;
 	struct http_header headers[32];
-	char raw_header[1024];
 	char *recv_buf;
 	char *send_buf;
 	int send_bufsize;
@@ -458,13 +457,12 @@ http_server_response (struct http_request *request, int keep_alive) {
 static int
 http_parser_callback_message_begin (http_parser *parser) {
 	struct http_request *request = parser->data;
-	struct socket *socket = request->socket;
-	struct socket *proxy_socket = request->proxy_socket;
-	char *sndbuf = request->send_buf;
-	memset(request, 0x00, sizeof(struct http_request));
-	request->socket = socket;
-	request->proxy_socket = proxy_socket;
-	request->send_buf = sndbuf;
+	request->method = 0;
+	request->request_url[0]='\0';
+	request->num_headers = 0;
+	request->last_header_element = 0;
+	request->send_bufsize = 0;
+	request->complete = 0;
 	return 0;
 }
 
