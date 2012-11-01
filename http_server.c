@@ -220,9 +220,10 @@ response_printf(struct http_request *request, int more, const char *fmt, ...) {
 static inline int
 response_write_chunk(struct http_request *request, char *buf, int len)
 {
-	response_printf(request, 1, "%lx\r\n", len);
-	response_write(request, buf, len, 1);
-	response_write(request, CRLF, 2, len==0);
+	response_printf(request, 1, "%x\r\n", len);
+	if (len)
+		response_write(request, buf, len, 1);
+	response_write(request, CRLF, 2, len!=0);
 	return 0;
 }
 
