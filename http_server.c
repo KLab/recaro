@@ -91,6 +91,7 @@
 #define CONTENT_TYPE "Content-Type: "
 #define CONTENT_LENGTH "Content-Length: "
 
+#define TEMP_BUFFER_SIZE 4096
 #define RECV_BUFFER_SIZE 4096
 #define SEND_BUFFER_SIZE (8*1024)
 
@@ -111,6 +112,7 @@ struct http_request {
 	struct http_header headers[32];
 	int send_bufsize;
 	int complete;
+	char temp_buf[TEMP_BUFFER_SIZE];
 	char recv_buf[RECV_BUFFER_SIZE];
 	char send_buf[SEND_BUFFER_SIZE];
 };
@@ -383,21 +385,19 @@ open_client_socket (const char *addr, ushort port, struct socket **res) {
 
 static int
 redirect_response (struct http_request *request) {
-	char buf[1500];
 	int len;
 	while (1) {
-		len = http_server_recv(request->proxy_socket, buf, sizeof(buf));
+		len = http_server_recv(request->proxy_socket, request->temp_buf, sizeof(request->temp_buf));
 		if (len <= 0) {
 			break;
 		}
-		http_server_send(request->socket, buf, len, 1);
+		http_server_send(request->socket, request->temp_buf, len, 1);
 	}
 	return 0;
 }
 
 static int
 redirect_get_request (struct http_request *request) {
-	char buf[1024];
 	int err, len, count;
 	if (!request->proxy_socket)	{
 		err = open_client_socket("127.0.0.1", 8080, &request->proxy_socket);
@@ -406,14 +406,14 @@ redirect_get_request (struct http_request *request) {
 			return 500;
 		}
 	}
-	len = snprintf(buf, sizeof(buf), "GET %s HTTP/1.1\r\n", request->request_url);
-	http_server_send(request->proxy_socket, buf, len, 1);
+	len = snprintf(request->temp_buf, sizeof(request->temp_buf), "GET %s HTTP/1.1\r\n", request->request_url);
+	http_server_send(request->proxy_socket, request->temp_buf, len, 1);
 	for (count = 0; count < request->num_headers; count++) {
 		if (strcmp(request->headers[count].name, "Connection") == 0) {
 			continue;
 		}
-		len = snprintf(buf, sizeof(buf), "%s: %s\r\n", request->headers[count].name, request->headers[count].value);
-		http_server_send(request->proxy_socket, buf, len, 1);
+		len = snprintf(request->temp_buf, sizeof(request->temp_buf), "%s: %s\r\n", request->headers[count].name, request->headers[count].value);
+		http_server_send(request->proxy_socket, request->temp_buf, len, 1);
 	}
 	http_server_send(request->proxy_socket, "Connection: Close\r\n\r\n", 21, 0);
 	return redirect_response(request);
@@ -469,7 +469,7 @@ static int
 http_parser_callback_message_begin (http_parser *parser) {
 	struct http_request *request = parser->data;
 	request->method = 0;
-	memset(request->request_url, 0, sizeof(request->request_url));
+	request->request_url[0] = 0;
 	memset(request->headers, 0, sizeof(request->headers));
 	request->num_headers = 0;
 	request->last_header_element = 0;
@@ -490,6 +490,7 @@ http_parser_callback_header_field (http_parser *parser, const char *p, size_t le
 	struct http_request *request = parser->data;
 	if (request->last_header_element != FIELD) {
 		request->num_headers++;
+		request->headers[request->num_headers - 1].name[0] = 0;
 	}
 	strncat(request->headers[request->num_headers - 1].name, p, len);
 	request->last_header_element = FIELD;
@@ -499,6 +500,9 @@ http_parser_callback_header_field (http_parser *parser, const char *p, size_t le
 static int
 http_parser_callback_header_value (http_parser *parser, const char *p, size_t len) {
 	struct http_request *request = parser->data;
+	if (request->last_header_element != VALUE) {
+		request->headers[request->num_headers - 1].value[0] = 0;
+	}
 	strncat(request->headers[request->num_headers - 1].value, p, len);
 	request->last_header_element = VALUE;
 	return 0;
@@ -508,7 +512,6 @@ static int
 http_parser_callback_headers_complete (http_parser *parser) {
 	struct http_request *request = parser->data;
 	int err, len, count;
-	char buf[1024];
 	request->method = parser->method;
 	if (request->method == HTTP_POST) {
 		if (!request->proxy_socket)	{
@@ -518,14 +521,14 @@ http_parser_callback_headers_complete (http_parser *parser) {
 				return 0;
 			}
 		}
-		len = snprintf(buf, sizeof(buf), "POST %s HTTP/1.1\r\n", request->request_url);
-		http_server_send(request->proxy_socket, buf, len, 1);
+		len = snprintf(request->temp_buf, sizeof(request->temp_buf), "POST %s HTTP/1.1\r\n", request->request_url);
+		http_server_send(request->proxy_socket, request->temp_buf, len, 1);
 		for (count = 0; count < request->num_headers; count++) {
 			if (strcmp(request->headers[count].name, "Connection") == 0) {
 				continue;
 			}
-			len = snprintf(buf, sizeof(buf), "%s: %s\r\n", request->headers[count].name, request->headers[count].value);
-			http_server_send(request->proxy_socket, buf, len, 1);
+			len = snprintf(request->temp_buf, sizeof(request->temp_buf), "%s: %s\r\n", request->headers[count].name, request->headers[count].value);
+			http_server_send(request->proxy_socket, request->temp_buf, len, 1);
 		}
 		http_server_send(request->proxy_socket, "Connection: Close\r\n\r\n", 21, 0);
 	}
