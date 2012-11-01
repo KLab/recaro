@@ -92,7 +92,7 @@
 #define CONTENT_LENGTH "Content-Length: "
 
 #define RECV_BUFFER_SIZE 4096
-#define SEND_BUFFER_SIZE (16*1024)
+#define SEND_BUFFER_SIZE (8*1024)
 
 #define STRANDSIZE(S) S, (sizeof(S)-1)
 
@@ -109,10 +109,10 @@ struct http_request {
 	int num_headers;
 	enum { NONE=0, FIELD, VALUE } last_header_element;
 	struct http_header headers[32];
-	char *recv_buf;
-	char *send_buf;
 	int send_bufsize;
 	int complete;
+	char recv_buf[RECV_BUFFER_SIZE];
+	char send_buf[SEND_BUFFER_SIZE];
 };
 
 static int
@@ -159,7 +159,6 @@ http_server_send (struct socket *sock, const char *buf, size_t size, int more) {
 		length = sock_sendmsg(sock, &msg, iov.iov_len);
 		if (length < 0) {
 			printk(KERN_ERR MODULE_NAME ": write error: %d done=%d\n", length, done);
-			printk(KERN_ERR MODULE_NAME ": buf=%p, size=%d, more=%d\n", buf, size, more);
 			break;
 		}
 		done += length;
@@ -382,12 +381,6 @@ open_client_socket (const char *addr, ushort port, struct socket **res) {
 	return 0;
 }
 
-static void
-close_client_socket (struct socket *socket) {
-	kernel_sock_shutdown(socket, SHUT_RDWR);
-	sock_release(socket);
-}
-
 static int
 redirect_response (struct http_request *request) {
 	char buf[1500];
@@ -585,19 +578,6 @@ http_server_worker (void *arg) {
 		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
 		return -1;
 	}
-	request->recv_buf = kmalloc(RECV_BUFFER_SIZE, GFP_KERNEL);
-	if (!request->recv_buf) {
-		kfree(request);
-		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
-		return -1;
-	}
-	request->send_buf = kmalloc(SEND_BUFFER_SIZE, GFP_KERNEL);
-	if (!request->send_buf) {
-		kfree(request->recv_buf);
-		kfree(request);
-		printk(KERN_ERR MODULE_NAME ": can't allocate memory!\n");
-		return -1;
-	}
 	request->send_bufsize = 0;
 	request->socket = socket;
 	request->proxy_socket = NULL;
@@ -622,8 +602,6 @@ http_server_worker (void *arg) {
 		kernel_sock_shutdown(request->proxy_socket, SHUT_RDWR);
 		sock_release(request->proxy_socket);
 	}
-	kfree(request->send_buf);
-	kfree(request->recv_buf);
 	kfree(request);
 	return 0;
 }
