@@ -26,5 +26,5 @@ text/html\r
 11
 """)
 
-mcset('fizz', 'FIZZ\n')
-mcset('buzz', 'FIZZ\n')
+mcset('fizz', 'FIZZ')
+mcset('buzz', 'BUZZ')

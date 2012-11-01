@@ -322,7 +322,7 @@ response_from_item(item_t *item, struct http_request *request, int *keep_alive) 
 			}
 
 			p = q + 3; // skip "-->"
-			q = strnstr(p, "<--#", end-p);
+			q = strnstr(p, "<!--#", end-p);
 		}
 		response_write_chunk(request, "", 0);
 		return 0;
