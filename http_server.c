@@ -370,23 +370,35 @@ open_client_socket (const char *addr, ushort port, struct socket **res) {
 }
 
 static int
-redirect_response (struct http_request *request) {
-	int len;
+redirect_response (struct http_request *request, int keep_alive) {
+	int len, found_connection_header = 0;
+	char *ptr;
 	while (1) {
-		len = http_server_recv(request->proxy_socket, request->temp_buf, sizeof(request->temp_buf));
+		len = http_server_recv(request->proxy_socket, request->temp_buf, sizeof(request->temp_buf) - 1);
 		if (len <= 0) {
 			if (len) {
 				printk(KERN_ERR MODULE_NAME ": recv error: %d\n", len);
 			}
 			break;
 		}
-		http_server_send(request->socket, request->temp_buf, len, 1);
+		request->temp_buf[len] = 0;
+		if (keep_alive && !found_connection_header) {
+			ptr = strstr(request->temp_buf, "Connection: close");
+			if (ptr) {
+				http_server_send(request->socket, request->temp_buf, ptr - request->temp_buf, 1);
+				http_server_send(request->socket, "Connection: keep-alive", 22, 1);
+				http_server_send(request->socket, ptr + 17, len - (ptr - request->temp_buf), 0);
+				found_connection_header = 1;
+				continue;
+			}
+		}
+		http_server_send(request->socket, request->temp_buf, len, 0);
 	}
 	return 0;
 }
 
 static int
-redirect_get_request (struct http_request *request) {
+redirect_get_request (struct http_request *request, int keep_alive) {
 	int err, len, count;
 	if (!request->proxy_socket)	{
 		err = open_client_socket("127.0.0.1", 8080, &request->proxy_socket);
@@ -405,7 +417,7 @@ redirect_get_request (struct http_request *request) {
 		http_server_send(request->proxy_socket, request->temp_buf, len, 1);
 	}
 	http_server_send(request->proxy_socket, "Connection: Close\r\n\r\n", 21, 0);
-	return redirect_response(request);
+	return redirect_response(request, keep_alive);
 }
 
 static int
@@ -416,12 +428,12 @@ do_get (struct http_request *request, int *keep_alive) {
 		release_item(item);
 		return status;
 	}
-	return redirect_get_request(request);
+	return redirect_get_request(request, *keep_alive);
 }
 
 static int
 do_post (struct http_request *request, int *keep_alive) {
-	return redirect_response(request);
+	return redirect_response(request, *keep_alive);
 }
 
 static int
